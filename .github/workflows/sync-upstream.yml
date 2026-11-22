@@ -1,0 +1,105 @@
+name: Sync fork with upstream
+
+# 用途：把 shuaiplus/nodewarden 的 main 同步到本 fork（maohaodong/nodewarden）。
+# 方式：硬同步（reset --hard），fork 上的文件改动会被上游覆盖 —— 当前 fork 无自有提交，可放心。
+# 保留：本文件自身 + PROTECTED 里列出的文件，会在 reset 后自动还原。
+# 影响范围：只动 git 文件；Cloudflare 的 Secrets / Workers 变量不在仓库里，不受影响。
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 每天 03:00 UTC = 北京时间 11:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: shuaiplus/nodewarden
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream main --prune --force
+
+      - name: Detect upstream changes
+        id: diff
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "上游无新提交，跳过"
+            exit 0
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          COMMITS=$(git rev-list --count HEAD..upstream/main)
+          echo "commits=$COMMITS" >> "$GITHUB_OUTPUT"
+
+          git diff --name-only HEAD upstream/main > /tmp/changed.txt
+          if grep -qE '^(package\.json|package-lock\.json)$' /tmp/changed.txt; then
+            echo "deps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deps=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "### 上游新增 ${COMMITS} 个提交"
+            git log --oneline HEAD..upstream/main | head -20
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hard reset to upstream
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          # reset --hard 会删掉上游没有的文件，包括本 workflow 自己，所以先打包备份。
+          PROTECTED=".github/workflows/sync-upstream.yml"
+          # 如果你改过部署配置并想保留，把下面两行的注释去掉（注意会顺带丢掉上游对这两个文件的更新）
+          # PROTECTED="$PROTECTED wrangler.toml"
+          # PROTECTED="$PROTECTED wrangler.kv.toml"
+
+          tar cf /tmp/keep.tar --ignore-failed-read $PROTECTED || true
+
+          git reset --hard upstream/main
+
+          if [ -s /tmp/keep.tar ]; then tar xf /tmp/keep.tar; fi
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "内容与上游一致，无需提交"
+          else
+            git commit -m "chore: sync fork to ${UPSTREAM_REPO}@$(git rev-parse --short upstream/main)"
+          fi
+
+          git push --force-with-lease origin main
+          echo "已对齐上游 $(git rev-parse --short upstream/main)"
+
+      - name: Summary
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          {
+            echo ""
+            echo "已同步到 \`$(git rev-parse --short upstream/main)\`"
+            if [ "${{ steps.diff.outputs.deps }}" = "true" ]; then
+              echo ""
+              echo "> \`package.json\` / \`package-lock.json\` 有变动，本地先 \`npm install\`，再 \`npx wrangler deploy\`。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
